@@ -1,0 +1,28 @@
+{
+  "name": "bruce-assistant",
+  "version": "1.0.0",
+  "description": "AI voice assistant for brewing, powered by Porcupine wake word + OpenAI Realtime API",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node examples/basic.js",
+    "dev": "node --watch examples/basic.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "voice",
+    "assistant",
+    "brewing",
+    "openai",
+    "porcupine"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@picovoice/porcupine-node": "^4.0.2",
+    "dotenv": "^17.3.1",
+    "node-record-lpcm16": "^1.0.1",
+    "speaker": "^0.5.5",
+    "ws": "^8.19.0"
+  }
+}

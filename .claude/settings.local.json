@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm info node-record-lpcm16@1.0.1 readme)",
+      "Bash(npm info speaker@0.5.5)",
+      "Bash(npm install @picovoice/porcupine-node node-record-lpcm16 speaker ws dotenv)"
+    ]
+  }
+}

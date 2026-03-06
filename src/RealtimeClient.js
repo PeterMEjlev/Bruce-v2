@@ -1,0 +1,247 @@
+'use strict';
+
+const { EventEmitter } = require('events');
+const WebSocket = require('ws');
+
+const REALTIME_URL = 'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview';
+const AUDIO_FORMAT = 'pcm16';
+
+class RealtimeClient extends EventEmitter {
+  /**
+   * @param {object} opts
+   * @param {string} opts.apiKey - OpenAI API key
+   * @param {string} [opts.voice='alloy'] - TTS voice
+   * @param {string} [opts.systemPrompt=''] - System instructions for the assistant
+   * @param {import('./FunctionRegistry')} opts.registry - Function registry instance
+   */
+  constructor({ apiKey, voice = 'alloy', systemPrompt = '', registry }) {
+    super();
+    this._apiKey = apiKey;
+    this._voice = voice;
+    this._systemPrompt = systemPrompt;
+    this._registry = registry;
+    this._ws = null;
+    this._sessionReady = false;
+    this._streaming = false;
+    // Accumulate function call arguments keyed by call_id
+    this._pendingFunctionCalls = new Map();
+  }
+
+  /**
+   * Open WebSocket and configure the session.
+   * Resolves when the session is ready to receive audio.
+   * @returns {Promise<void>}
+   */
+  connect() {
+    return new Promise((resolve, reject) => {
+      this._ws = new WebSocket(REALTIME_URL, {
+        headers: {
+          Authorization: `Bearer ${this._apiKey}`,
+          'OpenAI-Beta': 'realtime=v1',
+        },
+      });
+
+      this._ws.on('message', (data) => {
+        let event;
+        try {
+          event = JSON.parse(data.toString());
+        } catch {
+          return;
+        }
+        this._handleServerEvent(event, resolve, reject);
+      });
+
+      this._ws.on('error', (err) => {
+        this.emit('error', err);
+        reject(err);
+      });
+
+      this._ws.on('close', (code, reason) => {
+        this._sessionReady = false;
+        this._streaming = false;
+        this.emit('disconnected', { code, reason: reason.toString() });
+      });
+    });
+  }
+
+  disconnect() {
+    if (this._ws) {
+      this._ws.close();
+      this._ws = null;
+    }
+  }
+
+  /**
+   * Stream a PCM16 audio chunk to the Realtime API input buffer.
+   * @param {Buffer} chunk - Raw PCM16 LE bytes
+   */
+  sendAudioChunk(chunk) {
+    if (!this._sessionReady || !this._streaming) return;
+    this._send({
+      type: 'input_audio_buffer.append',
+      audio: chunk.toString('base64'),
+    });
+  }
+
+  /**
+   * Begin accepting audio chunks for a new utterance.
+   */
+  startStreaming() {
+    this._streaming = true;
+  }
+
+  /**
+   * Finalize the audio input and trigger a model response.
+   */
+  commitAndRespond() {
+    if (!this._sessionReady) return;
+    this._streaming = false;
+    this._send({ type: 'input_audio_buffer.commit' });
+    this._send({ type: 'response.create' });
+    this.emit('thinking');
+  }
+
+  /**
+   * Cancel an in-progress response (for barge-in).
+   */
+  cancelResponse() {
+    this._send({ type: 'response.cancel' });
+  }
+
+  get isReady() {
+    return this._sessionReady;
+  }
+
+  // ─── Private ──────────────────────────────────────────────────────────────
+
+  _send(event) {
+    if (this._ws && this._ws.readyState === WebSocket.OPEN) {
+      this._ws.send(JSON.stringify(event));
+    }
+  }
+
+  _configureSession() {
+    const tools = this._registry.getToolDefinitions();
+    this._send({
+      type: 'session.update',
+      session: {
+        modalities: ['text', 'audio'],
+        instructions: this._systemPrompt,
+        voice: this._voice,
+        input_audio_format: AUDIO_FORMAT,
+        output_audio_format: AUDIO_FORMAT,
+        // Disable server-side VAD — we commit audio manually after wake word + silence detection
+        turn_detection: null,
+        tools: tools,
+        tool_choice: tools.length > 0 ? 'auto' : 'none',
+        temperature: 0.8,
+      },
+    });
+  }
+
+  async _handleServerEvent(event, resolveConnect, rejectConnect) {
+    switch (event.type) {
+      case 'session.created':
+        // Server is ready — send our configuration
+        this._configureSession();
+        break;
+
+      case 'session.updated':
+        // Our config was accepted — session is fully ready
+        this._sessionReady = true;
+        this.emit('ready');
+        if (resolveConnect) resolveConnect();
+        break;
+
+      case 'response.audio.delta': {
+        // Incremental TTS audio chunk (Base64 PCM16)
+        const audioBuffer = Buffer.from(event.delta, 'base64');
+        this.emit('audioChunk', audioBuffer);
+        break;
+      }
+
+      case 'response.audio.done':
+        this.emit('audioDone');
+        break;
+
+      case 'response.output_item.added': {
+        // Capture function name when the output item is first announced
+        const item = event.item;
+        if (item && item.type === 'function_call') {
+          if (!this._pendingFunctionCalls.has(item.call_id)) {
+            this._pendingFunctionCalls.set(item.call_id, { name: item.name, argumentsStr: '' });
+          } else {
+            this._pendingFunctionCalls.get(item.call_id).name = item.name;
+          }
+        }
+        break;
+      }
+
+      case 'response.function_call_arguments.delta': {
+        // Accumulate partial function call arguments
+        const { call_id, delta } = event;
+        if (!this._pendingFunctionCalls.has(call_id)) {
+          this._pendingFunctionCalls.set(call_id, { name: null, argumentsStr: '' });
+        }
+        this._pendingFunctionCalls.get(call_id).argumentsStr += delta;
+        break;
+      }
+
+      case 'response.function_call_arguments.done': {
+        // All arguments have arrived — execute the function
+        const { call_id } = event;
+        const pending = this._pendingFunctionCalls.get(call_id);
+        if (!pending) break;
+
+        const fnName = pending.name;
+        let args = {};
+        try {
+          args = JSON.parse(pending.argumentsStr || '{}');
+        } catch {
+          args = {};
+        }
+
+        this._pendingFunctionCalls.delete(call_id);
+        this.emit('functionCall', fnName, args);
+
+        let result;
+        try {
+          result = await this._registry.execute(fnName, args);
+        } catch (err) {
+          result = `Error executing ${fnName}: ${err.message}`;
+        }
+
+        // Submit the function output back to the conversation
+        this._send({
+          type: 'conversation.item.create',
+          item: {
+            type: 'function_call_output',
+            call_id,
+            output: result,
+          },
+        });
+
+        // The API does NOT auto-continue after a function call — we must request a new response
+        this._send({ type: 'response.create' });
+        break;
+      }
+
+      case 'response.done':
+        this.emit('responseDone');
+        break;
+
+      case 'error': {
+        const err = new Error(`Realtime API error: ${event.error?.message || JSON.stringify(event.error)}`);
+        this.emit('error', err);
+        if (rejectConnect) rejectConnect(err);
+        break;
+      }
+
+      default:
+        // Silently ignore unhandled events (rate_limits.updated, input_audio_buffer.committed, etc.)
+        break;
+    }
+  }
+}
+
+module.exports = RealtimeClient;
