@@ -114,6 +114,56 @@ class AudioManager extends EventEmitter {
     this.emit('playbackStopped');
   }
 
+  /**
+   * Load a .wav file and cache its raw PCM data for instant playback.
+   * Call once at startup; playNotification() will use the cached buffer.
+   * @param {string} filePath - Path to a PCM16 LE mono .wav file
+   */
+  loadNotificationSound(filePath) {
+    const fs = require('fs');
+    const buf = fs.readFileSync(require('path').resolve(filePath));
+
+    // Parse WAV header to find the 'data' chunk
+    let offset = 12; // skip RIFF header
+    while (offset < buf.length - 8) {
+      const chunkId = buf.toString('ascii', offset, offset + 4);
+      const chunkSize = buf.readUInt32LE(offset + 4);
+      if (chunkId === 'data') {
+        this._notificationPCM = buf.slice(offset + 8, offset + 8 + chunkSize);
+        return;
+      }
+      offset += 8 + chunkSize;
+    }
+    throw new Error('Could not find data chunk in WAV file');
+  }
+
+  /**
+   * Play the pre-loaded notification sound through Speaker.
+   * Includes a silent preroll to avoid warmup clipping.
+   * @returns {Promise<void>}
+   */
+  playNotification() {
+    if (!this._notificationPCM) return Promise.resolve();
+
+    return new Promise((resolve) => {
+      const prerollMs = 150;
+      const prerollBytes = Math.floor(PLAYBACK_SAMPLE_RATE * (prerollMs / 1000)) * (BIT_DEPTH / 8) * CHANNELS;
+
+      const spk = new Speaker({
+        channels: CHANNELS,
+        bitDepth: BIT_DEPTH,
+        sampleRate: PLAYBACK_SAMPLE_RATE,
+        signed: true,
+      });
+
+      spk.on('flush', () => resolve());
+      spk.on('error', () => resolve());
+
+      spk.write(Buffer.alloc(prerollBytes)); // silent preroll
+      spk.end(this._notificationPCM);
+    });
+  }
+
   get isSpeaking() {
     return this._isSpeaking;
   }

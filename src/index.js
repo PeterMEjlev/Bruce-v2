@@ -1,12 +1,14 @@
 'use strict';
 
 require('dotenv').config();
+const path = require('path');
 const { EventEmitter } = require('events');
 const WakeWordDetector = require('./WakeWordDetector');
 const AudioManager = require('./AudioManager');
 const RealtimeClient = require('./RealtimeClient');
 const FunctionRegistry = require('./FunctionRegistry');
 const cfg = require('../config');
+
 
 const MAX_UTTERANCE_MS         = cfg.MAX_UTTERANCE_MS;
 const SILENCE_THRESHOLD_MS     = cfg.SILENCE_THRESHOLD_MS;
@@ -90,6 +92,7 @@ class BruceAssistant extends EventEmitter {
       }
     );
 
+    this._audio.loadNotificationSound(path.join(__dirname, '..', 'plop.wav'));
     await this._realtime.connect();
     this._wakeWord.start();
     this._audio.startMic({ device: this._config.micDevice });
@@ -172,8 +175,13 @@ class BruceAssistant extends EventEmitter {
     this._wakeWord.on('error', (err) => this.emit('error', err));
   }
 
-  _onWakeWordDetected() {
+  async _onWakeWordDetected() {
     this.emit('wake');
+
+    // Play a short beep so the user knows Bruce is listening,
+    // then start streaming — this way the mic won't send the beep to OpenAI.
+    await this._audio.playNotification();
+
     this._setState('listening');
     this.emit('listening');
 
@@ -234,7 +242,9 @@ class BruceAssistant extends EventEmitter {
     return samples > 0 ? Math.sqrt(sum / samples) : 0;
   }
 
-  _startFollowUp() {
+  async _startFollowUp() {
+    await this._audio.playNotification();
+
     this._setState('listening');
     this.emit('listening');
     this._realtime.startStreaming();
