@@ -3,7 +3,7 @@
 const { EventEmitter } = require('events');
 const WebSocket = require('ws');
 
-const REALTIME_URL = 'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview';
+const REALTIME_URL = 'wss://api.openai.com/v1/realtime?model=gpt-4o-mini-realtime-preview';
 const AUDIO_FORMAT = 'pcm16';
 
 class RealtimeClient extends EventEmitter {
@@ -106,6 +106,14 @@ class RealtimeClient extends EventEmitter {
    */
   cancelResponse() {
     this._send({ type: 'response.cancel' });
+  }
+
+  /**
+   * Clear the input audio buffer without committing (e.g. when no speech was detected).
+   */
+  clearAudioBuffer() {
+    this._streaming = false;
+    this._send({ type: 'input_audio_buffer.clear' });
   }
 
   get isReady() {

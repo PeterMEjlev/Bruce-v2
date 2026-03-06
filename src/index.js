@@ -6,16 +6,13 @@ const WakeWordDetector = require('./WakeWordDetector');
 const AudioManager = require('./AudioManager');
 const RealtimeClient = require('./RealtimeClient');
 const FunctionRegistry = require('./FunctionRegistry');
+const cfg = require('../config');
 
-// Maximum utterance length before auto-committing (ms)
-const MAX_UTTERANCE_MS = 10000;
-
-// How long silence must persist before committing audio (ms)
-const SILENCE_THRESHOLD_MS = 1500;
-
-// RMS energy below this level is considered silence (Int16 scale: 0–32768)
-// Tune upward in noisy environments
-const SILENCE_ENERGY_THRESHOLD = 200;
+const MAX_UTTERANCE_MS         = cfg.MAX_UTTERANCE_MS;
+const SILENCE_THRESHOLD_MS     = cfg.SILENCE_THRESHOLD_MS;
+const SILENCE_ENERGY_THRESHOLD = cfg.SILENCE_ENERGY_THRESHOLD;
+const FOLLOW_UP_TIMEOUT_MS     = cfg.FOLLOW_UP_TIMEOUT_MS;
+const DEBUG_ENERGY             = cfg.DEBUG_ENERGY || 'off';
 
 /**
  * BruceAssistant
@@ -68,6 +65,8 @@ class BruceAssistant extends EventEmitter {
 
     this._silenceTimer = null;
     this._utteranceTimer = null;
+    this._followUpTimer = null;
+    this._hasHeardVoice = false;
 
     this._bindEvents();
   }
@@ -76,6 +75,21 @@ class BruceAssistant extends EventEmitter {
    * Connect to OpenAI, start wake word detector and microphone.
    */
   async start() {
+    // Built-in function: Bruce calls this when the user wants to end the conversation
+    this._registry.register(
+      'end_conversation',
+      'End the current conversation and go back to sleep. Call this when the user says goodbye, stop, no more questions, or otherwise indicates they are done.',
+      { type: 'object', properties: {}, required: [] },
+      async () => {
+        this._cancelTimers();
+        this._audio.stopPlayback();
+        this._realtime.clearAudioBuffer();
+        this._setState('idle');
+        this.emit('idle');
+        return 'Conversation ended.';
+      }
+    );
+
     await this._realtime.connect();
     this._wakeWord.start();
     this._audio.startMic({ device: this._config.micDevice });
@@ -125,8 +139,9 @@ class BruceAssistant extends EventEmitter {
     });
 
     this._wakeWord.on('detected', () => {
-      if (this._state !== 'idle') return;
-      this._onWakeWordDetected();
+      if (this._state === 'idle') {
+        this._onWakeWordDetected();
+      }
     });
 
     // TTS audio chunks stream in as Base64-decoded PCM16 buffers
@@ -139,10 +154,9 @@ class BruceAssistant extends EventEmitter {
       this._audio.endPlayback();
     });
 
-    // Speaker finished — back to idle
+    // Speaker finished — listen for follow-up instead of going idle
     this._audio.on('speakingEnd', () => {
-      this._setState('idle');
-      this.emit('idle');
+      this._startFollowUp();
     });
 
     this._realtime.on('thinking', () => {
@@ -163,6 +177,7 @@ class BruceAssistant extends EventEmitter {
     this._setState('listening');
     this.emit('listening');
 
+    this._hasHeardVoice = false;
     this._realtime.startStreaming();
 
     // Safety valve: auto-commit after MAX_UTTERANCE_MS even without silence
@@ -171,12 +186,23 @@ class BruceAssistant extends EventEmitter {
 
   _checkSilence(chunk) {
     const rms = this._computeRMS(chunk);
+    if (DEBUG_ENERGY === 'listening' || DEBUG_ENERGY === 'all') {
+      process.stdout.write(`\r[Energy] listening: ${Math.round(rms).toString().padStart(5)} (threshold: ${SILENCE_ENERGY_THRESHOLD})`);
+    }
     if (rms < SILENCE_ENERGY_THRESHOLD) {
       if (!this._silenceTimer) {
         this._silenceTimer = setTimeout(() => this._commitAudio(), SILENCE_THRESHOLD_MS);
       }
     } else {
       // Voice energy detected — reset silence timer
+      this._hasHeardVoice = true;
+      if (this._followUpTimer) {
+        clearTimeout(this._followUpTimer);
+        this._followUpTimer = null;
+      }
+      if (!this._utteranceTimer) {
+        this._utteranceTimer = setTimeout(() => this._commitAudio(), MAX_UTTERANCE_MS);
+      }
       if (this._silenceTimer) {
         clearTimeout(this._silenceTimer);
         this._silenceTimer = null;
@@ -187,6 +213,13 @@ class BruceAssistant extends EventEmitter {
   _commitAudio() {
     this._cancelTimers();
     if (this._state !== 'listening') return;
+    if (!this._hasHeardVoice) {
+      // No speech detected during follow-up — go idle
+      this._realtime.clearAudioBuffer();
+      this._setState('idle');
+      this.emit('idle');
+      return;
+    }
     this._realtime.commitAndRespond();
   }
 
@@ -201,9 +234,25 @@ class BruceAssistant extends EventEmitter {
     return samples > 0 ? Math.sqrt(sum / samples) : 0;
   }
 
+  _startFollowUp() {
+    this._setState('listening');
+    this.emit('listening');
+    this._realtime.startStreaming();
+    this._hasHeardVoice = false;
+
+    this._followUpTimer = setTimeout(() => {
+      if (this._state === 'listening' && !this._hasHeardVoice) {
+        this._realtime.clearAudioBuffer();
+        this._setState('idle');
+        this.emit('idle');
+      }
+    }, FOLLOW_UP_TIMEOUT_MS);
+  }
+
   _cancelTimers() {
     if (this._silenceTimer) { clearTimeout(this._silenceTimer); this._silenceTimer = null; }
     if (this._utteranceTimer) { clearTimeout(this._utteranceTimer); this._utteranceTimer = null; }
+    if (this._followUpTimer) { clearTimeout(this._followUpTimer); this._followUpTimer = null; }
   }
 
   _setState(state) {
