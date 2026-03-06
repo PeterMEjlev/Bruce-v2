@@ -130,6 +130,12 @@ class AudioManager extends EventEmitter {
       signed: true,
     });
 
+    // Write a short silent preroll so the speaker warmup doesn't clip the first word
+    const prerollMs = 250;
+    const bytesPerSample = BIT_DEPTH / 8;
+    const prerollBytes = Math.floor(PLAYBACK_SAMPLE_RATE * (prerollMs / 1000)) * bytesPerSample * CHANNELS;
+    this._speaker.write(Buffer.alloc(prerollBytes));
+
     this._speaker.on('open', () => {
       this._isSpeaking = true;
       this.emit('speakingStart');
