@@ -166,6 +166,10 @@ class BruceAssistant extends EventEmitter {
       this._setState('thinking');
     });
 
+    this._realtime.on('transcript', (text) => {
+      this.emit('transcript', text);
+    });
+
     this._realtime.on('functionCall', (name, args) => {
       this.emit('functionCall', name, args);
     });

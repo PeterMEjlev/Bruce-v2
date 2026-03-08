@@ -138,6 +138,7 @@ class RealtimeClient extends EventEmitter {
         voice: this._voice,
         input_audio_format: AUDIO_FORMAT,
         output_audio_format: AUDIO_FORMAT,
+        input_audio_transcription: { model: 'whisper-1' },
         // Disable server-side VAD — we commit audio manually after wake word + silence detection
         turn_detection: null,
         tools: tools,
@@ -231,6 +232,12 @@ class RealtimeClient extends EventEmitter {
 
         // The API does NOT auto-continue after a function call — we must request a new response
         this._send({ type: 'response.create' });
+        break;
+      }
+
+      case 'conversation.item.input_audio_transcription.completed': {
+        const transcript = event.transcript?.trim();
+        if (transcript) this.emit('transcript', transcript);
         break;
       }
 

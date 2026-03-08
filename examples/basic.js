@@ -18,10 +18,10 @@ const bruce = new BruceAssistant({
     `You are Bruce, a knowledgeable and friendly AI assistant for a home brewing setup.
 You can read temperatures from three pots (BK = Boil Kettle, MLT = Mash/Lauter Tun, HLT = Hot Liquor Tank), control heating elements and regulation on BK and HLT, and control two pumps (P1 and P2).
 The MLT only has a temperature sensor — no heater. Regulation is a simple on/off thermostat that maintains a target temperature.
-Keep responses concise and conversational — you are speaking, not writing.
+Keep responses very concise and conversational — you are speaking, not writing.
 After responding, the user can continue talking to you without repeating your name.
 When the user says goodbye, stop, that's all, or otherwise indicates they are done, call the end_conversation function.`,
-  voice: process.env.BRUCE_VOICE || 'alloy',
+  voice: process.env.BRUCE_VOICE || 'ash',
   sensitivity: 0.6,
 });
 
@@ -218,12 +218,49 @@ bruce.registerFunction(
 
 // ── Event listeners ──────────────────────────────────────────────────────────
 
+// Transcript arrives asynchronously (Whisper runs parallel to the LLM response).
+// Buffer status messages after "listening" and flush them only after the transcript
+// is printed — or after a timeout if transcription takes too long.
+const TRANSCRIPT_FLUSH_TIMEOUT_MS = 3000;
+let msgQueue = [];
+let flushTimer = null;
+let waitingForTranscript = false;
+
+function scheduleFlush() {
+  if (flushTimer) return;
+  flushTimer = setTimeout(flushQueue, TRANSCRIPT_FLUSH_TIMEOUT_MS);
+}
+
+function flushQueue() {
+  if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
+  waitingForTranscript = false;
+  msgQueue.splice(0).forEach(m => console.log(m));
+}
+
 bruce.on('ready', () => console.log('[Bruce] Ready. Say "Bruce" to activate.'));
 bruce.on('wake', () => console.log('[Bruce] Wake word detected! Listening...'));
-bruce.on('listening', () => process.stdout.write('[Bruce] Listening'));
-bruce.on('thinking', () => console.log('\n[Bruce] Processing...'));
-bruce.on('speaking', () => console.log('[Bruce] Speaking...'));
-bruce.on('idle', () => console.log('[Bruce] Back to idle. Say "Bruce" again anytime.\n'));
+bruce.on('listening', () => {
+  waitingForTranscript = true;
+  msgQueue = [];
+  process.stdout.write('[Bruce] Listening\n');
+  scheduleFlush();
+});
+bruce.on('transcript', (text) => {
+  console.log(`[You] ${text}`);
+  flushQueue();
+});
+bruce.on('thinking', () => {
+  if (waitingForTranscript) { msgQueue.push('[Bruce] Processing...'); }
+  else { console.log('[Bruce] Processing...'); }
+});
+bruce.on('speaking', () => {
+  if (waitingForTranscript) { msgQueue.push('[Bruce] Speaking...'); }
+  else { console.log('[Bruce] Speaking...'); }
+});
+bruce.on('idle', () => {
+  flushQueue();
+  console.log('[Bruce] Back to idle. Say "Bruce" again anytime.\n');
+});
 bruce.on('functionCall', (name, args) =>
   console.log(`[Bruce] Calling: ${name}`, JSON.stringify(args))
 );
