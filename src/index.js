@@ -80,7 +80,7 @@ class BruceAssistant extends EventEmitter {
     // Built-in function: Bruce calls this when the user wants to end the conversation
     this._registry.register(
       'end_conversation',
-      'End the current conversation and go back to sleep. Call this when the user says goodbye, stop, no more questions, or otherwise indicates they are done.',
+      'End the current conversation and go back to sleep. You MUST call this whenever the user says goodbye, stop, that\'s it, thank you, no more questions, never mind, or any phrase indicating they are finished.',
       { type: 'object', properties: {}, required: [] },
       async () => {
         this._cancelTimers();
@@ -149,6 +149,7 @@ class BruceAssistant extends EventEmitter {
 
     // TTS audio chunks stream in as Base64-decoded PCM16 buffers
     this._realtime.on('audioChunk', (buffer) => {
+      if (this._state === 'idle') return;  // conversation already ended
       if (this._state !== 'speaking') this._setState('speaking');
       this._audio.playChunk(buffer);
     });
@@ -159,11 +160,23 @@ class BruceAssistant extends EventEmitter {
 
     // Speaker finished — listen for follow-up instead of going idle
     this._audio.on('speakingEnd', () => {
+      if (this._state === 'idle') return;  // conversation already ended
       this._startFollowUp();
     });
 
     this._realtime.on('thinking', () => {
       this._setState('thinking');
+    });
+
+    // Safety net: if a response completes while still in 'thinking' (no audio
+    // produced, no function called), transition to idle so the system doesn't
+    // get stuck.
+    this._realtime.on('responseDone', () => {
+      if (this._state === 'thinking') {
+        this._cancelTimers();
+        this._setState('idle');
+        this.emit('idle');
+      }
     });
 
     this._realtime.on('transcript', (text) => {

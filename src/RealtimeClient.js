@@ -143,7 +143,7 @@ class RealtimeClient extends EventEmitter {
         turn_detection: null,
         tools: tools,
         tool_choice: tools.length > 0 ? 'auto' : 'none',
-        temperature: 0.8,
+        temperature: 0.6,
       },
     });
   }
@@ -229,6 +229,9 @@ class RealtimeClient extends EventEmitter {
             output: result,
           },
         });
+
+        // end_conversation already moved to idle — no further response needed
+        if (fnName === 'end_conversation') break;
 
         // The API does NOT auto-continue after a function call — we must request a new response
         this._send({ type: 'response.create' });

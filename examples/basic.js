@@ -20,7 +20,14 @@ You can read temperatures from three pots (BK = Boil Kettle, MLT = Mash/Lauter T
 The MLT only has a temperature sensor — no heater. Regulation is a simple on/off thermostat that maintains a target temperature.
 Keep responses very concise and conversational — you are speaking, not writing.
 After responding, the user can continue talking to you without repeating your name.
-When the user says goodbye, stop, that's all, or otherwise indicates they are done, call the end_conversation function.`,
+
+## CRITICAL RULE — ending the conversation
+Before generating ANY spoken reply, first evaluate whether the user is signaling the conversation is over. If the user's message does NOT contain a clear question or actionable request, and includes ANY of the following cues, you MUST call the end_conversation function:
+- Farewell or gratitude: "thank you", "thanks", "goodbye", "bye", "see you", "cheers"
+- Closure phrases: "that's it", "that's all", "I'm done", "I'm good", "all set", "no more", "never mind", "nothing else"
+- Dismissals: "stop", "enough", "I don't need help", "not right now", "no thanks"
+- Any combination of the above (e.g. "Thank you, that's it, I don't need any help")
+When in doubt, call end_conversation. You may say a brief goodbye like "See you!" before calling it.`,
   voice: process.env.BRUCE_VOICE || 'ash',
   sensitivity: 0.6,
 });
@@ -219,17 +226,14 @@ bruce.registerFunction(
 // ── Event listeners ──────────────────────────────────────────────────────────
 
 // Transcript arrives asynchronously (Whisper runs parallel to the LLM response).
-// Buffer status messages after "listening" and flush them only after the transcript
-// is printed — or after a timeout if transcription takes too long.
-const TRANSCRIPT_FLUSH_TIMEOUT_MS = 3000;
+// Buffer ALL status messages after "listening" and only flush once the transcript
+// arrives — this guarantees [You] always prints before [Bruce] Processing/Speaking/
+// function calls and idle messages.  A fallback timeout flushes if the transcript
+// never arrives (e.g. Whisper failure).
+const TRANSCRIPT_FLUSH_TIMEOUT_MS = 8000;
 let msgQueue = [];
 let flushTimer = null;
 let waitingForTranscript = false;
-
-function scheduleFlush() {
-  if (flushTimer) return;
-  flushTimer = setTimeout(flushQueue, TRANSCRIPT_FLUSH_TIMEOUT_MS);
-}
 
 function flushQueue() {
   if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
@@ -237,32 +241,31 @@ function flushQueue() {
   msgQueue.splice(0).forEach(m => console.log(m));
 }
 
+function queueOrLog(msg) {
+  if (waitingForTranscript) { msgQueue.push(msg); }
+  else { console.log(msg); }
+}
+
 bruce.on('ready', () => console.log('[Bruce] Ready. Say "Bruce" to activate.'));
 bruce.on('wake', () => console.log('[Bruce] Wake word detected! Listening...'));
 bruce.on('listening', () => {
   waitingForTranscript = true;
   msgQueue = [];
+  if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
+  flushTimer = setTimeout(flushQueue, TRANSCRIPT_FLUSH_TIMEOUT_MS);
   process.stdout.write('[Bruce] Listening\n');
-  scheduleFlush();
 });
 bruce.on('transcript', (text) => {
   console.log(`[You] ${text}`);
   flushQueue();
 });
-bruce.on('thinking', () => {
-  if (waitingForTranscript) { msgQueue.push('[Bruce] Processing...'); }
-  else { console.log('[Bruce] Processing...'); }
-});
-bruce.on('speaking', () => {
-  if (waitingForTranscript) { msgQueue.push('[Bruce] Speaking...'); }
-  else { console.log('[Bruce] Speaking...'); }
-});
+bruce.on('thinking', () => queueOrLog('[Bruce] Processing...'));
+bruce.on('speaking', () => queueOrLog('[Bruce] Speaking...'));
 bruce.on('idle', () => {
-  flushQueue();
-  console.log('[Bruce] Back to idle. Say "Bruce" again anytime.\n');
+  queueOrLog('[Bruce] Back to idle. Say "Bruce" again anytime.\n');
 });
 bruce.on('functionCall', (name, args) =>
-  console.log(`[Bruce] Calling: ${name}`, JSON.stringify(args))
+  queueOrLog(`[Bruce] Calling: ${name} ${JSON.stringify(args)}`)
 );
 bruce.on('error', (err) => console.error('[Bruce] Error:', err));
 
