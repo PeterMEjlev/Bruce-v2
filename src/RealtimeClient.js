@@ -2,6 +2,7 @@
 
 const { EventEmitter } = require('events');
 const WebSocket = require('ws');
+const cfg = require('../config');
 
 const REALTIME_URL = 'wss://api.openai.com/v1/realtime?model=gpt-4o-mini-realtime-preview';
 const AUDIO_FORMAT = 'pcm16';
@@ -22,7 +23,6 @@ class RealtimeClient extends EventEmitter {
     this._registry = registry;
     this._ws = null;
     this._sessionReady = false;
-    this._streaming = false;
     // Accumulate function call arguments keyed by call_id
     this._pendingFunctionCalls = new Map();
   }
@@ -58,7 +58,6 @@ class RealtimeClient extends EventEmitter {
 
       this._ws.on('close', (code, reason) => {
         this._sessionReady = false;
-        this._streaming = false;
         this.emit('disconnected', { code, reason: reason.toString() });
       });
     });
@@ -76,7 +75,7 @@ class RealtimeClient extends EventEmitter {
    * @param {Buffer} chunk - Raw PCM16 LE bytes
    */
   sendAudioChunk(chunk) {
-    if (!this._sessionReady || !this._streaming) return;
+    if (!this._sessionReady) return;
     this._send({
       type: 'input_audio_buffer.append',
       audio: chunk.toString('base64'),
@@ -84,35 +83,16 @@ class RealtimeClient extends EventEmitter {
   }
 
   /**
-   * Begin accepting audio chunks for a new utterance.
-   */
-  startStreaming() {
-    this._streaming = true;
-  }
-
-  /**
-   * Finalize the audio input and trigger a model response.
-   */
-  commitAndRespond() {
-    if (!this._sessionReady) return;
-    this._streaming = false;
-    this._send({ type: 'input_audio_buffer.commit' });
-    this._send({ type: 'response.create' });
-    this.emit('thinking');
-  }
-
-  /**
-   * Cancel an in-progress response (for barge-in).
+   * Cancel an in-progress response (for barge-in interruption).
    */
   cancelResponse() {
     this._send({ type: 'response.cancel' });
   }
 
   /**
-   * Clear the input audio buffer without committing (e.g. when no speech was detected).
+   * Clear the input audio buffer without committing.
    */
   clearAudioBuffer() {
-    this._streaming = false;
     this._send({ type: 'input_audio_buffer.clear' });
   }
 
@@ -139,8 +119,13 @@ class RealtimeClient extends EventEmitter {
         input_audio_format: AUDIO_FORMAT,
         output_audio_format: AUDIO_FORMAT,
         input_audio_transcription: { model: 'whisper-1' },
-        // Disable server-side VAD — we commit audio manually after wake word + silence detection
-        turn_detection: null,
+        // Server-side VAD: OpenAI detects speech start/stop and auto-commits
+        turn_detection: {
+          type: 'server_vad',
+          threshold: cfg.VAD_THRESHOLD,
+          prefix_padding_ms: cfg.VAD_PREFIX_PADDING_MS,
+          silence_duration_ms: cfg.VAD_SILENCE_DURATION_MS,
+        },
         tools: tools,
         tool_choice: tools.length > 0 ? 'auto' : 'none',
         temperature: 0.8,
@@ -151,19 +136,30 @@ class RealtimeClient extends EventEmitter {
   async _handleServerEvent(event, resolveConnect, rejectConnect) {
     switch (event.type) {
       case 'session.created':
-        // Server is ready — send our configuration
         this._configureSession();
         break;
 
       case 'session.updated':
-        // Our config was accepted — session is fully ready
         this._sessionReady = true;
         this.emit('ready');
         if (resolveConnect) resolveConnect();
         break;
 
+      // ── Server VAD events ───────────────────────────────────────────────
+
+      case 'input_audio_buffer.speech_started':
+        // User started talking — emit so BruceAssistant can handle barge-in
+        this.emit('speechStarted');
+        break;
+
+      case 'input_audio_buffer.speech_stopped':
+        // User stopped talking — server will auto-commit and create response
+        this.emit('speechStopped');
+        break;
+
+      // ── Response audio ──────────────────────────────────────────────────
+
       case 'response.audio.delta': {
-        // Incremental TTS audio chunk (Base64 PCM16)
         const audioBuffer = Buffer.from(event.delta, 'base64');
         this.emit('audioChunk', audioBuffer);
         break;
@@ -173,8 +169,9 @@ class RealtimeClient extends EventEmitter {
         this.emit('audioDone');
         break;
 
+      // ── Function calls ──────────────────────────────────────────────────
+
       case 'response.output_item.added': {
-        // Capture function name when the output item is first announced
         const item = event.item;
         if (item && item.type === 'function_call') {
           if (!this._pendingFunctionCalls.has(item.call_id)) {
@@ -187,7 +184,6 @@ class RealtimeClient extends EventEmitter {
       }
 
       case 'response.function_call_arguments.delta': {
-        // Accumulate partial function call arguments
         const { call_id, delta } = event;
         if (!this._pendingFunctionCalls.has(call_id)) {
           this._pendingFunctionCalls.set(call_id, { name: null, argumentsStr: '' });
@@ -197,7 +193,6 @@ class RealtimeClient extends EventEmitter {
       }
 
       case 'response.function_call_arguments.done': {
-        // All arguments have arrived — execute the function
         const { call_id } = event;
         const pending = this._pendingFunctionCalls.get(call_id);
         if (!pending) break;
@@ -235,6 +230,8 @@ class RealtimeClient extends EventEmitter {
         break;
       }
 
+      // ── Transcription & completion ──────────────────────────────────────
+
       case 'conversation.item.input_audio_transcription.completed': {
         const transcript = event.transcript?.trim();
         if (transcript) this.emit('transcript', transcript);
@@ -246,14 +243,16 @@ class RealtimeClient extends EventEmitter {
         break;
 
       case 'error': {
-        const err = new Error(`Realtime API error: ${event.error?.message || JSON.stringify(event.error)}`);
+        const msg = event.error?.message || JSON.stringify(event.error);
+        // With server VAD, cancellation race conditions are expected — don't treat as errors
+        if (msg && msg.includes('Cancellation failed')) break;
+        const err = new Error(`Realtime API error: ${msg}`);
         this.emit('error', err);
         if (rejectConnect) rejectConnect(err);
         break;
       }
 
       default:
-        // Silently ignore unhandled events (rate_limits.updated, input_audio_buffer.committed, etc.)
         break;
     }
   }

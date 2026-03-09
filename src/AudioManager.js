@@ -107,6 +107,9 @@ class AudioManager extends EventEmitter {
     this._speakerQueue = [];
     this._speakerDraining = false;
     if (this._speaker) {
+      // Remove all listeners to prevent stale callbacks after destruction
+      this._speaker.removeAllListeners();
+      try { this._speaker.close(); } catch { /* ignore */ }
       this._speaker.destroy();
       this._speaker = null;
     }

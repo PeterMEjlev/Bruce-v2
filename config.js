@@ -6,34 +6,32 @@
  */
 module.exports = {
 
-  // ── Voice Activity Detection ─────────────────────────────────────────────
-
-  // RMS energy below this level is treated as silence (scale: 0–32768)
-  // Increase if background noise causes false "speech detected" triggers
-  SILENCE_ENERGY_THRESHOLD: 200,
-
-  // How long (ms) of continuous silence before committing audio to OpenAI
-  // Shorter = Bruce responds faster; longer = more natural pauses allowed
-  SILENCE_THRESHOLD_MS: 1500,
-
-  // Maximum time (ms) Bruce will listen before force-committing audio
-  // Safety valve to prevent endless listening if silence detection fails
-  MAX_UTTERANCE_MS: 10000,
-
-
   // ── Conversation Flow ────────────────────────────────────────────────────
 
-  // How long (ms) to wait for a follow-up question after Bruce finishes speaking
-  // If no voice is detected in this window, Bruce goes back to idle
-  FOLLOW_UP_TIMEOUT_MS: 5000,
+  // How long (ms) of inactivity before Bruce ends the conversation and returns to idle.
+  // Resets whenever the user speaks or Bruce responds.
+  CONVERSATION_IDLE_TIMEOUT_MS: 15000,
+
+
+  // ── Server-side VAD (Voice Activity Detection) ────────────────────────────
+  // These are passed to OpenAI's Realtime API server_vad turn detection.
+
+  // Activation threshold (0.0–1.0). Lower = more sensitive to speech.
+  // Higher values reduce false interruptions from speaker echo / background noise.
+  VAD_THRESHOLD: 0.8,
+
+  // Amount of speech audio (ms) to include before the detected speech start.
+  VAD_PREFIX_PADDING_MS: 300,
+
+  // Duration of silence (ms) after speech before the server commits the turn.
+  VAD_SILENCE_DURATION_MS: 500,
 
 
   // ── Debug ────────────────────────────────────────────────────────────────
 
   // Print microphone energy levels to the console
-  // Useful for tuning SILENCE_ENERGY_THRESHOLD and BARGE_IN_ENERGY_THRESHOLD
-  // 'off'      — no energy logging
-  // 'listening' — log energy while Bruce is listening for your speech
+  // 'off'       — no energy logging
+  // 'listening' — log energy while Bruce is in conversation
   DEBUG_ENERGY: 'off',
 
 };

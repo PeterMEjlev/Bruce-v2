@@ -9,12 +9,7 @@ const RealtimeClient = require('./RealtimeClient');
 const FunctionRegistry = require('./FunctionRegistry');
 const cfg = require('../config');
 
-
-const MAX_UTTERANCE_MS         = cfg.MAX_UTTERANCE_MS;
-const SILENCE_THRESHOLD_MS     = cfg.SILENCE_THRESHOLD_MS;
-const SILENCE_ENERGY_THRESHOLD = cfg.SILENCE_ENERGY_THRESHOLD;
-const FOLLOW_UP_TIMEOUT_MS     = cfg.FOLLOW_UP_TIMEOUT_MS;
-const DEBUG_ENERGY             = cfg.DEBUG_ENERGY || 'off';
+const CONVERSATION_IDLE_TIMEOUT_MS = cfg.CONVERSATION_IDLE_TIMEOUT_MS;
 
 /**
  * BruceAssistant
@@ -26,9 +21,12 @@ const DEBUG_ENERGY             = cfg.DEBUG_ENERGY || 'off';
  *  - Audio playback (speaker)
  *  - Function/tool calling
  *
- * State machine: idle → listening → thinking → speaking → idle
+ * Uses OpenAI server-side VAD for real-time conversation with barge-in support.
+ * The user can interrupt Bruce at any time by speaking.
  *
- * Events: ready | wake | listening | thinking | speaking | idle | functionCall | error
+ * State machine: idle → conversing → idle
+ *
+ * Events: ready | wake | listening | thinking | speaking | idle | interrupted | functionCall | transcript | error
  */
 class BruceAssistant extends EventEmitter {
   /**
@@ -38,7 +36,7 @@ class BruceAssistant extends EventEmitter {
    * @param {string} config.wakeWordPath - Path to .ppn wake word file
    * @param {string} [config.systemPrompt] - System instructions for Bruce
    * @param {string} [config.voice='alloy'] - TTS voice
-   * @param {number} [config.sensitivity=0.5] - Wake word sensitivity (0.0–1.0)
+   * @param {number} [config.sensitivity=0.5] - Wake word sensitivity (0.0-1.0)
    * @param {string} [config.micDevice] - Optional mic device (e.g. 'plughw:1' on Linux)
    */
   constructor(config) {
@@ -65,10 +63,8 @@ class BruceAssistant extends EventEmitter {
       registry: this._registry,
     });
 
-    this._silenceTimer = null;
-    this._utteranceTimer = null;
-    this._followUpTimer = null;
-    this._hasHeardVoice = false;
+    this._idleTimer = null;
+    this._isSpeaking = false;
 
     this._bindEvents();
   }
@@ -83,11 +79,7 @@ class BruceAssistant extends EventEmitter {
       'End the current conversation and go back to sleep. Call this when the user says goodbye, stop, no more questions, or otherwise indicates they are done.',
       { type: 'object', properties: {}, required: [] },
       async () => {
-        this._cancelTimers();
-        this._audio.stopPlayback();
-        this._realtime.clearAudioBuffer();
-        this._setState('idle');
-        this.emit('idle');
+        this._endConversation();
         return 'Conversation ended.';
       }
     );
@@ -115,10 +107,6 @@ class BruceAssistant extends EventEmitter {
   /**
    * Register a tool Bruce can call during conversation.
    * Can be called before or after start().
-   * @param {string} name - snake_case function name
-   * @param {string} description - Description for the LLM
-   * @param {object} parameters - JSON Schema object
-   * @param {Function} handler - async (args) => string
    */
   registerFunction(name, description, parameters, handler) {
     this._registry.register(name, description, parameters, handler);
@@ -131,13 +119,17 @@ class BruceAssistant extends EventEmitter {
   // ─── Private ──────────────────────────────────────────────────────────────
 
   _bindEvents() {
-    // Mic audio is routed based on current state
+    // Mic audio routing based on current state
     this._audio.on('data', (chunk) => {
       if (this._state === 'idle') {
+        // In idle mode, only feed audio to wake word detector
         this._wakeWord.processAudio(chunk);
-      } else if (this._state === 'listening') {
+      } else if (this._state === 'conversing') {
+        // Mute mic → server while Bruce is speaking to prevent his own voice
+        // from being picked up by the mic and causing false interruptions (echo).
+        // Audio resumes as soon as Bruce finishes speaking.
+        if (this._isSpeaking) return;
         this._realtime.sendAudioChunk(chunk);
-        this._checkSilence(chunk);
       }
     });
 
@@ -147,23 +139,61 @@ class BruceAssistant extends EventEmitter {
       }
     });
 
-    // TTS audio chunks stream in as Base64-decoded PCM16 buffers
+    // ── Server VAD events ───────────────────────────────────────────────
+
+    this._realtime.on('speechStarted', () => {
+      console.log(`[DEBUG] speechStarted | state=${this._state} isSpeaking=${this._isSpeaking}`);
+      if (this._state !== 'conversing') return;
+
+      // Reset the idle timer — user is speaking
+      this._resetIdleTimer();
+    });
+
+    this._realtime.on('speechStopped', () => {
+      console.log(`[DEBUG] speechStopped | state=${this._state} isSpeaking=${this._isSpeaking} interrupted=${this._interrupted}`);
+      if (this._state !== 'conversing') return;
+      // Server will auto-commit and create a response — nothing to do here
+    });
+
+    // ── Response events ─────────────────────────────────────────────────
+
     this._realtime.on('audioChunk', (buffer) => {
-      if (this._state !== 'speaking') this._setState('speaking');
+      if (this._state !== 'conversing') {
+        console.log(`[DEBUG] audioChunk DROPPED (state=${this._state})`);
+        return;
+      }
+      if (!this._isSpeaking) {
+        this._isSpeaking = true;
+        console.log(`[DEBUG] audioChunk — first chunk, Bruce starts speaking (mic muted to server)`);
+        this.emit('speaking');
+      }
       this._audio.playChunk(buffer);
     });
 
     this._realtime.on('audioDone', () => {
+      console.log(`[DEBUG] audioDone | isSpeaking=${this._isSpeaking}`);
       this._audio.endPlayback();
     });
 
-    // Speaker finished — listen for follow-up instead of going idle
+    // Speaker finished playing all audio
     this._audio.on('speakingEnd', () => {
-      this._startFollowUp();
+      console.log(`[DEBUG] speakingEnd — speaker finished playback`);
+      this._isSpeaking = false;
+      // Reset idle timer after Bruce finishes speaking — wait for follow-up
+      this._resetIdleTimer();
     });
 
-    this._realtime.on('thinking', () => {
-      this._setState('thinking');
+    this._audio.on('playbackStopped', () => {
+      console.log(`[DEBUG] playbackStopped — speaker destroyed (barge-in or end_conversation)`);
+      this._isSpeaking = false;
+    });
+
+    this._realtime.on('responseDone', () => {
+      console.log(`[DEBUG] responseDone | state=${this._state}`);
+      // Reset idle timer after each complete response
+      if (this._state === 'conversing') {
+        this._resetIdleTimer();
+      }
     });
 
     this._realtime.on('transcript', (text) => {
@@ -182,97 +212,51 @@ class BruceAssistant extends EventEmitter {
   async _onWakeWordDetected() {
     this.emit('wake');
 
-    // Play a short beep so the user knows Bruce is listening,
-    // then start streaming — this way the mic won't send the beep to OpenAI.
+    // Play notification so the user knows Bruce is listening
     await this._audio.playNotification();
 
-    this._setState('listening');
+    this._setState('conversing');
     this.emit('listening');
 
-    this._hasHeardVoice = false;
-    this._realtime.startStreaming();
-
-    // Safety valve: auto-commit after MAX_UTTERANCE_MS even without silence
-    this._utteranceTimer = setTimeout(() => this._commitAudio(), MAX_UTTERANCE_MS);
+    // Start the idle timer — if no activity, go back to sleep
+    this._resetIdleTimer();
   }
 
-  _checkSilence(chunk) {
-    const rms = this._computeRMS(chunk);
-    if (DEBUG_ENERGY === 'listening' || DEBUG_ENERGY === 'all') {
-      process.stdout.write(`\r[Energy] listening: ${Math.round(rms).toString().padStart(5)} (threshold: ${SILENCE_ENERGY_THRESHOLD})`);
-    }
-    if (rms < SILENCE_ENERGY_THRESHOLD) {
-      if (!this._silenceTimer) {
-        this._silenceTimer = setTimeout(() => this._commitAudio(), SILENCE_THRESHOLD_MS);
-      }
-    } else {
-      // Voice energy detected — reset silence timer
-      this._hasHeardVoice = true;
-      if (this._followUpTimer) {
-        clearTimeout(this._followUpTimer);
-        this._followUpTimer = null;
-      }
-      if (!this._utteranceTimer) {
-        this._utteranceTimer = setTimeout(() => this._commitAudio(), MAX_UTTERANCE_MS);
-      }
-      if (this._silenceTimer) {
-        clearTimeout(this._silenceTimer);
-        this._silenceTimer = null;
-      }
-    }
-  }
-
-  _commitAudio() {
+  _endConversation() {
+    console.log(`[DEBUG] _endConversation called | isSpeaking=${this._isSpeaking}`);
     this._cancelTimers();
-    if (this._state !== 'listening') return;
-    if (!this._hasHeardVoice) {
-      // No speech detected during follow-up — go idle
-      this._realtime.clearAudioBuffer();
-      this._setState('idle');
-      this.emit('idle');
-      return;
-    }
-    this._realtime.commitAndRespond();
+    this._audio.stopPlayback();
+    this._realtime.clearAudioBuffer();
+    this._isSpeaking = false;
+    this._setState('idle');
+    this.emit('idle');
   }
 
-  _computeRMS(buffer) {
-    // PCM16 LE: 2 bytes per sample, signed
-    let sum = 0;
-    const samples = Math.floor(buffer.length / 2);
-    for (let i = 0; i < buffer.length - 1; i += 2) {
-      const sample = buffer.readInt16LE(i);
-      sum += sample * sample;
+  _resetIdleTimer() {
+    if (this._idleTimer) {
+      clearTimeout(this._idleTimer);
     }
-    return samples > 0 ? Math.sqrt(sum / samples) : 0;
-  }
-
-  async _startFollowUp() {
-    await this._audio.playNotification();
-
-    this._setState('listening');
-    this.emit('listening');
-    this._realtime.startStreaming();
-    this._hasHeardVoice = false;
-
-    this._followUpTimer = setTimeout(() => {
-      if (this._state === 'listening' && !this._hasHeardVoice) {
-        this._realtime.clearAudioBuffer();
-        this._setState('idle');
-        this.emit('idle');
+    console.log(`[DEBUG] idleTimer reset (${CONVERSATION_IDLE_TIMEOUT_MS}ms)`);
+    this._idleTimer = setTimeout(() => {
+      if (this._state === 'conversing') {
+        console.log(`[DEBUG] idleTimer EXPIRED — ending conversation`);
+        this._endConversation();
       }
-    }, FOLLOW_UP_TIMEOUT_MS);
+    }, CONVERSATION_IDLE_TIMEOUT_MS);
   }
 
   _cancelTimers() {
-    if (this._silenceTimer) { clearTimeout(this._silenceTimer); this._silenceTimer = null; }
-    if (this._utteranceTimer) { clearTimeout(this._utteranceTimer); this._utteranceTimer = null; }
-    if (this._followUpTimer) { clearTimeout(this._followUpTimer); this._followUpTimer = null; }
+    if (this._idleTimer) {
+      clearTimeout(this._idleTimer);
+      this._idleTimer = null;
+    }
   }
 
   _setState(state) {
+    if (this._state !== state) {
+      console.log(`[DEBUG] STATE: ${this._state} → ${state}`);
+    }
     this._state = state;
-    if (state === 'thinking') this.emit('thinking');
-    if (state === 'speaking') this.emit('speaking');
   }
 }
 

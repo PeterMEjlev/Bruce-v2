@@ -20,7 +20,8 @@ You can read temperatures from three pots (BK = Boil Kettle, MLT = Mash/Lauter T
 The MLT only has a temperature sensor — no heater. Regulation is a simple on/off thermostat that maintains a target temperature.
 Keep responses very concise and conversational — you are speaking, not writing.
 After responding, the user can continue talking to you without repeating your name.
-When the user says goodbye, stop, that's all, or otherwise indicates they are done, call the end_conversation function.`,
+
+IMPORTANT: When the user indicates they are done — by saying things like "goodbye", "thanks that's all", "stop", "that will be all", "I'm done", "no more questions", or any similar farewell — you MUST immediately call the end_conversation function. Do NOT just say goodbye verbally — you MUST call the function.`,
   voice: process.env.BRUCE_VOICE || 'ash',
   sensitivity: 0.6,
 });
@@ -238,20 +239,16 @@ function flushQueue() {
 }
 
 bruce.on('ready', () => console.log('[Bruce] Ready. Say "Bruce" to activate.'));
-bruce.on('wake', () => console.log('[Bruce] Wake word detected! Listening...'));
+bruce.on('wake', () => console.log('[Bruce] Wake word detected!'));
 bruce.on('listening', () => {
   waitingForTranscript = true;
   msgQueue = [];
-  process.stdout.write('[Bruce] Listening\n');
+  process.stdout.write('[Bruce] Listening (realtime conversation active)\n');
   scheduleFlush();
 });
 bruce.on('transcript', (text) => {
   console.log(`[You] ${text}`);
   flushQueue();
-});
-bruce.on('thinking', () => {
-  if (waitingForTranscript) { msgQueue.push('[Bruce] Processing...'); }
-  else { console.log('[Bruce] Processing...'); }
 });
 bruce.on('speaking', () => {
   if (waitingForTranscript) { msgQueue.push('[Bruce] Speaking...'); }
