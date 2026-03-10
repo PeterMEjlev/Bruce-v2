@@ -129,7 +129,15 @@ class AudioManager extends EventEmitter {
       const chunkId = buf.toString('ascii', offset, offset + 4);
       const chunkSize = buf.readUInt32LE(offset + 4);
       if (chunkId === 'data') {
-        this._notificationPCM = buf.slice(offset + 8, offset + 8 + chunkSize);
+        const raw = buf.slice(offset + 8, offset + 8 + chunkSize);
+        // Amplify notification sound (1.0 = original, 2.0 = 2× louder, etc.)
+        const gain = 3.0;
+        const amplified = Buffer.alloc(raw.length);
+        for (let i = 0; i < raw.length - 1; i += 2) {
+          const sample = Math.max(-32768, Math.min(32767, Math.round(raw.readInt16LE(i) * gain)));
+          amplified.writeInt16LE(sample, i);
+        }
+        this._notificationPCM = amplified;
         return;
       }
       offset += 8 + chunkSize;

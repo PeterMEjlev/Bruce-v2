@@ -226,17 +226,16 @@ bruce.registerFunction(
 // ── Event listeners ──────────────────────────────────────────────────────────
 
 // Transcript arrives asynchronously (Whisper runs parallel to the LLM response).
-// Buffer ALL status messages after "listening" and only flush once the transcript
-// arrives — this guarantees [You] always prints before [Bruce] Processing/Speaking/
-// function calls and idle messages.  A fallback timeout flushes if the transcript
-// never arrives (e.g. Whisper failure).
-const TRANSCRIPT_FLUSH_TIMEOUT_MS = 8000;
+// We buffer status messages briefly after "thinking" fires, giving the transcript
+// a short grace period to arrive first so [You] prints before [Bruce] Processing.
+// If the transcript doesn't arrive in time, we flush and print status in real-time.
+const TRANSCRIPT_GRACE_MS = 1500;
 let msgQueue = [];
-let flushTimer = null;
 let waitingForTranscript = false;
+let graceTimer = null;
 
 function flushQueue() {
-  if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
+  if (graceTimer) { clearTimeout(graceTimer); graceTimer = null; }
   waitingForTranscript = false;
   msgQueue.splice(0).forEach(m => console.log(m));
 }
@@ -251,18 +250,24 @@ bruce.on('wake', () => console.log('[Bruce] Wake word detected! Listening...'));
 bruce.on('listening', () => {
   waitingForTranscript = true;
   msgQueue = [];
-  if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
-  flushTimer = setTimeout(flushQueue, TRANSCRIPT_FLUSH_TIMEOUT_MS);
+  if (graceTimer) { clearTimeout(graceTimer); graceTimer = null; }
   process.stdout.write('[Bruce] Listening\n');
 });
 bruce.on('transcript', (text) => {
   console.log(`[You] ${text}`);
   flushQueue();
 });
-bruce.on('thinking', () => queueOrLog('[Bruce] Processing...'));
+bruce.on('thinking', () => {
+  queueOrLog('[Bruce] Processing...');
+  // Give the transcript a short window to arrive before flushing
+  if (waitingForTranscript && !graceTimer) {
+    graceTimer = setTimeout(flushQueue, TRANSCRIPT_GRACE_MS);
+  }
+});
 bruce.on('speaking', () => queueOrLog('[Bruce] Speaking...'));
 bruce.on('idle', () => {
-  queueOrLog('[Bruce] Back to idle. Say "Bruce" again anytime.\n');
+  if (waitingForTranscript) flushQueue();
+  console.log('[Bruce] Back to idle. Say "Bruce" again anytime.\n');
 });
 bruce.on('functionCall', (name, args) =>
   queueOrLog(`[Bruce] Calling: ${name} ${JSON.stringify(args)}`)
