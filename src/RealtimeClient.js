@@ -25,6 +25,8 @@ class RealtimeClient extends EventEmitter {
     this._streaming = false;
     // Accumulate function call arguments keyed by call_id
     this._pendingFunctionCalls = new Map();
+    // True while waiting for the follow-up response after a function call
+    this._awaitingFunctionResponse = false;
   }
 
   /**
@@ -213,6 +215,11 @@ class RealtimeClient extends EventEmitter {
         this._pendingFunctionCalls.delete(call_id);
         this.emit('functionCall', fnName, args);
 
+        // Set flag BEFORE awaiting — response.done can arrive during the await
+        if (fnName !== 'end_conversation') {
+          this._awaitingFunctionResponse = true;
+        }
+
         let result;
         try {
           result = await this._registry.execute(fnName, args);
@@ -245,7 +252,13 @@ class RealtimeClient extends EventEmitter {
       }
 
       case 'response.done':
-        this.emit('responseDone');
+        if (this._awaitingFunctionResponse) {
+          // This response.done is for the function-call response — the follow-up
+          // spoken response is still coming, so don't emit responseDone yet.
+          this._awaitingFunctionResponse = false;
+        } else {
+          this.emit('responseDone');
+        }
         break;
 
       case 'error': {
