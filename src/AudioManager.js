@@ -164,11 +164,26 @@ class AudioManager extends EventEmitter {
         signed: true,
       });
 
-      spk.on('flush', () => resolve());
-      spk.on('error', () => resolve());
+      spk.on('flush', () => {
+        if (!spk.destroyed) {
+          spk.removeAllListeners();
+          spk.destroy();
+        }
+        resolve();
+      });
+      spk.on('error', () => {
+        if (!spk.destroyed) {
+          spk.removeAllListeners();
+          spk.destroy();
+        }
+        resolve();
+      });
 
       spk.write(Buffer.alloc(prerollBytes)); // silent preroll
-      spk.end(this._notificationPCM);
+      spk.write(this._notificationPCM);
+      const postrollMs = 150;
+      const postrollBytes2 = Math.floor(PLAYBACK_SAMPLE_RATE * (postrollMs / 1000)) * (BIT_DEPTH / 8) * CHANNELS;
+      spk.end(Buffer.alloc(postrollBytes2)); // silent postroll
     });
   }
 
@@ -201,8 +216,15 @@ class AudioManager extends EventEmitter {
 
     this._speaker.on('flush', () => {
       this._isSpeaking = false;
+      const spk = this._speaker;
       this._speaker = null;
       this._speakerDraining = false;
+      // Force-release native audio resources immediately instead of waiting
+      // for GC — lingering native handles cause crackling on Windows.
+      if (spk && !spk.destroyed) {
+        spk.removeAllListeners();
+        spk.destroy();
+      }
       this.emit('speakingEnd');
     });
 
@@ -228,8 +250,11 @@ class AudioManager extends EventEmitter {
       const chunk = this._speakerQueue.shift();
 
       if (chunk === null) {
-        // End of TTS response — flush and close speaker
-        this._speaker.end();
+        // Write a silent postroll before closing to avoid pop/crackle
+        const postrollMs = 250;
+        const bytesPerSample = BIT_DEPTH / 8;
+        const postrollBytes = Math.floor(PLAYBACK_SAMPLE_RATE * (postrollMs / 1000)) * bytesPerSample * CHANNELS;
+        this._speaker.end(Buffer.alloc(postrollBytes));
         return;
       }
 

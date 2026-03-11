@@ -151,7 +151,6 @@ class BruceAssistant extends EventEmitter {
   /** @private */
   async _doSpeak(text) {
     this._skipFollowUp = true;
-    await this._audio.playNotification();
     this._realtime.sendText(text);
   }
 
@@ -182,6 +181,7 @@ class BruceAssistant extends EventEmitter {
     });
 
     this._realtime.on('audioDone', () => {
+      if (this._state === 'idle') return;  // don't open a phantom speaker after conversation ended
       this._audio.endPlayback();
     });
 
