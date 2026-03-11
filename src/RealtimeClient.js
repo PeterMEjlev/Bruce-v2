@@ -25,8 +25,10 @@ class RealtimeClient extends EventEmitter {
     this._streaming = false;
     // Accumulate function call arguments keyed by call_id
     this._pendingFunctionCalls = new Map();
-    // True while waiting for the follow-up response after a function call
-    this._awaitingFunctionResponse = false;
+    // Completed function calls waiting to be executed when response.done fires
+    this._completedCalls = [];
+    // Response phase: null | 'announce' | 'execute' | 'results'
+    this._responsePhase = null;
   }
 
   /**
@@ -99,7 +101,15 @@ class RealtimeClient extends EventEmitter {
     if (!this._sessionReady) return;
     this._streaming = false;
     this._send({ type: 'input_audio_buffer.commit' });
-    this._send({ type: 'response.create' });
+    // Phase 1: force speech-only so Bruce announces before calling functions
+    this._responsePhase = 'announce';
+    this._send({
+      type: 'response.create',
+      response: {
+        tool_choice: 'none',
+        instructions: 'Briefly announce what you are ABOUT to do (e.g. "Sure, let me turn those on for you"). Do NOT confirm completion or say you have done it — you have not performed the actions yet. Keep it to one short sentence.',
+      },
+    });
     this.emit('thinking');
   }
 
@@ -118,6 +128,7 @@ class RealtimeClient extends EventEmitter {
         content: [{ type: 'input_text', text }],
       },
     });
+    this._responsePhase = null;
     this._send({ type: 'response.create' });
     this.emit('thinking');
   }
@@ -139,6 +150,10 @@ class RealtimeClient extends EventEmitter {
 
   get isReady() {
     return this._sessionReady;
+  }
+
+  get responsePhase() {
+    return this._responsePhase;
   }
 
   // ─── Private ──────────────────────────────────────────────────────────────
@@ -218,7 +233,7 @@ class RealtimeClient extends EventEmitter {
       }
 
       case 'response.function_call_arguments.done': {
-        // All arguments have arrived — execute the function
+        // All arguments have arrived — queue for batch execution at response.done
         const { call_id } = event;
         const pending = this._pendingFunctionCalls.get(call_id);
         if (!pending) break;
@@ -233,34 +248,7 @@ class RealtimeClient extends EventEmitter {
 
         this._pendingFunctionCalls.delete(call_id);
         this.emit('functionCall', fnName, args);
-
-        // Set flag BEFORE awaiting — response.done can arrive during the await
-        if (fnName !== 'end_conversation') {
-          this._awaitingFunctionResponse = true;
-        }
-
-        let result;
-        try {
-          result = await this._registry.execute(fnName, args);
-        } catch (err) {
-          result = `Error executing ${fnName}: ${err.message}`;
-        }
-
-        // Submit the function output back to the conversation
-        this._send({
-          type: 'conversation.item.create',
-          item: {
-            type: 'function_call_output',
-            call_id,
-            output: result,
-          },
-        });
-
-        // end_conversation already moved to idle — no further response needed
-        if (fnName === 'end_conversation') break;
-
-        // The API does NOT auto-continue after a function call — we must request a new response
-        this._send({ type: 'response.create' });
+        this._completedCalls.push({ call_id, fnName, args });
         break;
       }
 
@@ -270,15 +258,69 @@ class RealtimeClient extends EventEmitter {
         break;
       }
 
-      case 'response.done':
-        if (this._awaitingFunctionResponse) {
-          // This response.done is for the function-call response — the follow-up
-          // spoken response is still coming, so don't emit responseDone yet.
-          this._awaitingFunctionResponse = false;
+      case 'response.done': {
+        const calls = this._completedCalls.splice(0);
+
+        if (this._responsePhase === 'announce') {
+          // Phase 1 done: Bruce spoke announcement, now let model call functions
+          this._responsePhase = 'execute';
+          this._send({
+            type: 'response.create',
+            response: { modalities: ['text'], tool_choice: 'auto' },
+          });
+        } else if (calls.length > 0) {
+          // Functions were called — execute all in parallel
+          const results = await Promise.all(
+            calls.map(async ({ call_id, fnName, args }) => {
+              let result;
+              try {
+                result = await this._registry.execute(fnName, args);
+              } catch (err) {
+                result = `Error executing ${fnName}: ${err.message}`;
+              }
+              return { call_id, fnName, result };
+            })
+          );
+
+          const ended = results.some(r => r.fnName === 'end_conversation');
+
+          for (const { call_id, result } of results) {
+            this._send({
+              type: 'conversation.item.create',
+              item: { type: 'function_call_output', call_id, output: result },
+            });
+          }
+
+          if (!ended) {
+            // Stay in execute phase — model may need to call more functions
+            this._responsePhase = 'execute';
+            this._send({
+              type: 'response.create',
+              response: { modalities: ['text'], tool_choice: 'auto' },
+            });
+          } else {
+            this._responsePhase = null;
+          }
+        } else if (this._responsePhase === 'execute') {
+          // No more functions to call — Phase 3: let model share results with audio
+          this._responsePhase = 'results';
+          this._send({
+            type: 'response.create',
+            response: { tool_choice: 'none' },
+          });
+        } else if (this._responsePhase === 'results') {
+          // Phase 2 done, no functions needed
+          this._responsePhase = null;
+          this.emit('responseDone');
+        } else if (this._responsePhase === 'results') {
+          // Phase 3 done
+          this._responsePhase = null;
+          this.emit('responseDone');
         } else {
           this.emit('responseDone');
         }
         break;
+      }
 
       case 'error': {
         const err = new Error(`Realtime API error: ${event.error?.message || JSON.stringify(event.error)}`);

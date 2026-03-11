@@ -72,6 +72,7 @@ class BruceAssistant extends EventEmitter {
     this._hasHeardVoice = false;
     this._skipFollowUp = false;
     this._peakEnergy = 0;
+    this._audioPlayedThisTurn = false;
 
     this._bindEvents();
   }
@@ -179,6 +180,7 @@ class BruceAssistant extends EventEmitter {
     this._realtime.on('audioChunk', (buffer) => {
       if (this._state === 'idle') return;  // conversation already ended
       if (this._state !== 'speaking') this._setState('speaking');
+      this._audioPlayedThisTurn = true;
       this._audio.playChunk(buffer);
     });
 
@@ -196,6 +198,12 @@ class BruceAssistant extends EventEmitter {
         this.emit('idle');
         return;
       }
+      // If more response phases are coming (functions to execute, results to share),
+      // go back to thinking and wait instead of starting follow-up
+      if (this._realtime.responsePhase) {
+        this._setState('thinking');
+        return;
+      }
       this._startFollowUp();
     });
 
@@ -203,14 +211,18 @@ class BruceAssistant extends EventEmitter {
       this._setState('thinking');
     });
 
-    // Safety net: if a response completes while still in 'thinking' (no audio
-    // produced, no function called), transition to idle so the system doesn't
-    // get stuck.
+    // When all response phases are complete:
+    // - If audio was played this turn, start follow-up listening
+    // - Otherwise (safety net), go idle
     this._realtime.on('responseDone', () => {
       if (this._state === 'thinking') {
         this._cancelTimers();
-        this._setState('idle');
-        this.emit('idle');
+        if (this._audioPlayedThisTurn) {
+          this._startFollowUp();
+        } else {
+          this._setState('idle');
+          this.emit('idle');
+        }
       }
     });
 
@@ -240,6 +252,7 @@ class BruceAssistant extends EventEmitter {
     this._hasHeardVoice = false;
     this._peakEnergy = 0;
     this._listeningStartedAt = Date.now();
+    this._audioPlayedThisTurn = false;
     this._realtime.startStreaming();
 
     // Safety valve: auto-commit after MAX_UTTERANCE_MS even without silence
