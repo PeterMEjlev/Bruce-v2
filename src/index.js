@@ -14,6 +14,7 @@ const MAX_UTTERANCE_MS         = cfg.MAX_UTTERANCE_MS;
 const SILENCE_THRESHOLD_MS     = cfg.SILENCE_THRESHOLD_MS;
 const SILENCE_ENERGY_THRESHOLD = cfg.SILENCE_ENERGY_THRESHOLD;
 const FOLLOW_UP_TIMEOUT_MS     = cfg.FOLLOW_UP_TIMEOUT_MS;
+const MIN_SPEECH_ENERGY        = cfg.MIN_SPEECH_ENERGY;
 const DEBUG_ENERGY             = cfg.DEBUG_ENERGY || 'off';
 
 /**
@@ -70,6 +71,7 @@ class BruceAssistant extends EventEmitter {
     this._followUpTimer = null;
     this._hasHeardVoice = false;
     this._skipFollowUp = false;
+    this._peakEnergy = 0;
 
     this._bindEvents();
   }
@@ -236,6 +238,8 @@ class BruceAssistant extends EventEmitter {
     this.emit('listening');
 
     this._hasHeardVoice = false;
+    this._peakEnergy = 0;
+    this._listeningStartedAt = Date.now();
     this._realtime.startStreaming();
 
     // Safety valve: auto-commit after MAX_UTTERANCE_MS even without silence
@@ -254,6 +258,10 @@ class BruceAssistant extends EventEmitter {
     } else {
       // Voice energy detected — reset silence timer
       this._hasHeardVoice = true;
+      // Ignore energy for 300ms after listening starts to avoid plop bleed-through
+      if (rms > this._peakEnergy && Date.now() - this._listeningStartedAt > 300) {
+        this._peakEnergy = rms;
+      }
       if (this._followUpTimer) {
         clearTimeout(this._followUpTimer);
         this._followUpTimer = null;
@@ -271,8 +279,9 @@ class BruceAssistant extends EventEmitter {
   _commitAudio() {
     this._cancelTimers();
     if (this._state !== 'listening') return;
-    if (!this._hasHeardVoice) {
-      // No speech detected during follow-up — go idle
+    console.log(`[Bruce] Peak energy: ${Math.round(this._peakEnergy)} (min: ${MIN_SPEECH_ENERGY})`);
+    if (!this._hasHeardVoice || this._peakEnergy < MIN_SPEECH_ENERGY) {
+      // No meaningful speech detected — go idle
       this._realtime.clearAudioBuffer();
       this._setState('idle');
       this.emit('idle');
@@ -299,6 +308,8 @@ class BruceAssistant extends EventEmitter {
     this.emit('listening');
     this._realtime.startStreaming();
     this._hasHeardVoice = false;
+    this._peakEnergy = 0;
+    this._listeningStartedAt = Date.now();
 
     this._followUpTimer = setTimeout(() => {
       if (this._state === 'listening' && !this._hasHeardVoice) {

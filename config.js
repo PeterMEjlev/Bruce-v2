@@ -12,6 +12,11 @@ module.exports = {
   // Increase if background noise causes false "speech detected" triggers
   SILENCE_ENERGY_THRESHOLD: 200,
 
+  // Minimum peak RMS energy required to send audio to the model (scale: 0–32768)
+  // Prevents quiet noise / silence from being transcribed as garbage text
+  // Should be higher than SILENCE_ENERGY_THRESHOLD
+  MIN_SPEECH_ENERGY: 400,
+
   // How long (ms) of continuous silence before committing audio to OpenAI
   // Shorter = Bruce responds faster; longer = more natural pauses allowed
   SILENCE_THRESHOLD_MS: 1500,
