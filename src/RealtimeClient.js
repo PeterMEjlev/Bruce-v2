@@ -104,6 +104,25 @@ class RealtimeClient extends EventEmitter {
   }
 
   /**
+   * Inject a text message into the conversation and trigger a model response.
+   * Used for unprompted speech (e.g. reminders) without requiring audio input.
+   * @param {string} text - The text to send as a user message
+   */
+  sendText(text) {
+    if (!this._sessionReady) return;
+    this._send({
+      type: 'conversation.item.create',
+      item: {
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_text', text }],
+      },
+    });
+    this._send({ type: 'response.create' });
+    this.emit('thinking');
+  }
+
+  /**
    * Cancel an in-progress response (for barge-in).
    */
   cancelResponse() {

@@ -69,6 +69,7 @@ class BruceAssistant extends EventEmitter {
     this._utteranceTimer = null;
     this._followUpTimer = null;
     this._hasHeardVoice = false;
+    this._skipFollowUp = false;
 
     this._bindEvents();
   }
@@ -128,6 +129,32 @@ class BruceAssistant extends EventEmitter {
     return this._state;
   }
 
+  /**
+   * Make Bruce speak unprompted by injecting a text message into the conversation.
+   * Bruce will respond with TTS audio as if the user had spoken to him.
+   * @param {string} text - The text prompt for Bruce to respond to
+   */
+  speak(text) {
+    if (!this._realtime.isReady) return;
+    // If Bruce is busy (listening/thinking/speaking), wait for idle
+    if (this._state !== 'idle') {
+      const onIdle = () => {
+        this.removeListener('idle', onIdle);
+        this._doSpeak(text);
+      };
+      this.on('idle', onIdle);
+      return;
+    }
+    this._doSpeak(text);
+  }
+
+  /** @private */
+  async _doSpeak(text) {
+    this._skipFollowUp = true;
+    await this._audio.playNotification();
+    this._realtime.sendText(text);
+  }
+
   // ─── Private ──────────────────────────────────────────────────────────────
 
   _bindEvents() {
@@ -161,6 +188,12 @@ class BruceAssistant extends EventEmitter {
     // Speaker finished — listen for follow-up instead of going idle
     this._audio.on('speakingEnd', () => {
       if (this._state === 'idle') return;  // conversation already ended
+      if (this._skipFollowUp) {
+        this._skipFollowUp = false;
+        this._setState('idle');
+        this.emit('idle');
+        return;
+      }
       this._startFollowUp();
     });
 
