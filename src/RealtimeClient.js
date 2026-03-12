@@ -209,6 +209,12 @@ class RealtimeClient extends EventEmitter {
         this.emit('audioDone');
         break;
 
+      case 'response.audio_transcript.done': {
+        const text = event.transcript?.trim();
+        if (text) this.emit('reply', text);
+        break;
+      }
+
       case 'response.output_item.added': {
         // Capture function name when the output item is first announced
         const item = event.item;

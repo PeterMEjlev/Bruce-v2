@@ -234,6 +234,10 @@ class BruceAssistant extends EventEmitter {
       this.emit('functionCall', name, args);
     });
 
+    this._realtime.on('reply', (text) => {
+      this.emit('reply', text);
+    });
+
     this._audio.on('error', (err) => this.emit('error', err));
     this._realtime.on('error', (err) => this.emit('error', err));
     this._wakeWord.on('error', (err) => this.emit('error', err));
