@@ -302,7 +302,11 @@ class RealtimeClient extends EventEmitter {
             this._responsePhase = 'execute';
             this._send({
               type: 'response.create',
-              response: { modalities: ['text'], tool_choice: 'auto' },
+              response: {
+                modalities: ['text'],
+                tool_choice: 'auto',
+                instructions: 'If you need to call additional functions, do so now. Otherwise respond with just the word "done" — do NOT summarize or discuss the results yet, you will speak them aloud in the next step.',
+              },
             });
           } else {
             this._responsePhase = null;
@@ -312,14 +316,14 @@ class RealtimeClient extends EventEmitter {
           this._responsePhase = 'results';
           this._send({
             type: 'response.create',
-            response: { tool_choice: 'none' },
+            response: {
+              modalities: ['text', 'audio'],
+              tool_choice: 'none',
+              instructions: 'Now speak the function results to the user. You MUST relay every specific number, keg number, name, and data point from the function results — do not skip, abbreviate, or gloss over any of them.',
+            },
           });
         } else if (this._responsePhase === 'results') {
-          // Phase 2 done, no functions needed
-          this._responsePhase = null;
-          this.emit('responseDone');
-        } else if (this._responsePhase === 'results') {
-          // Phase 3 done
+          // Phase 3 done — results have been spoken
           this._responsePhase = null;
           this.emit('responseDone');
         } else {

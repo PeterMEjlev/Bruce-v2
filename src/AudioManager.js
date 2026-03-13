@@ -18,6 +18,15 @@ class AudioManager extends EventEmitter {
     this._isSpeaking = false;
     this._speakerQueue = [];
     this._speakerDraining = false;
+    this._gain = 1.0; // 0.0–1.0 speech volume
+  }
+
+  /**
+   * Set playback volume gain (0.0 = silent, 1.0 = full volume).
+   * @param {number} gain
+   */
+  setVolume(gain) {
+    this._gain = Math.max(0, Math.min(1, gain));
   }
 
   /**
@@ -225,7 +234,14 @@ class AudioManager extends EventEmitter {
         spk.removeAllListeners();
         spk.destroy();
       }
-      this.emit('speakingEnd');
+      // If more audio chunks arrived while the previous speaker was draining
+      // (e.g. a new response phase started before the old one finished playing),
+      // create a new speaker and keep playing instead of emitting speakingEnd.
+      if (this._speakerQueue.length > 0) {
+        this._drainQueue();
+      } else {
+        this.emit('speakingEnd');
+      }
     });
 
     this._speaker.on('error', (err) => {
@@ -258,8 +274,18 @@ class AudioManager extends EventEmitter {
         return;
       }
 
+      // Apply volume gain to PCM16 samples
+      let output = chunk;
+      if (this._gain < 1.0) {
+        output = Buffer.alloc(chunk.length);
+        for (let i = 0; i < chunk.length - 1; i += 2) {
+          const sample = Math.max(-32768, Math.min(32767, Math.round(chunk.readInt16LE(i) * this._gain)));
+          output.writeInt16LE(sample, i);
+        }
+      }
+
       // Respect back-pressure: if write() returns false, wait for 'drain'
-      const canContinue = this._speaker.write(chunk);
+      const canContinue = this._speaker.write(output);
       if (canContinue) {
         setImmediate(writeNext);
       } else {

@@ -133,6 +133,14 @@ class BruceAssistant extends EventEmitter {
   }
 
   /**
+   * Set Bruce's speech volume (0.0 = silent, 1.0 = full volume).
+   * @param {number} gain
+   */
+  setVolume(gain) {
+    this._audio.setVolume(gain);
+  }
+
+  /**
    * Make Bruce speak unprompted by injecting a text message into the conversation.
    * Bruce will respond with TTS audio as if the user had spoken to him.
    * @param {string} text - The text prompt for Bruce to respond to
