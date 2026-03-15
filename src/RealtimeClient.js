@@ -27,6 +27,8 @@ class RealtimeClient extends EventEmitter {
     this._pendingFunctionCalls = new Map();
     // Completed function calls waiting to be executed when response.done fires
     this._completedCalls = [];
+    // Stores stringified function results to inject into the results-phase prompt
+    this._lastFunctionResults = '';
     // Response phase: null | 'announce' | 'execute' | 'results'
     this._responsePhase = null;
   }
@@ -290,6 +292,12 @@ class RealtimeClient extends EventEmitter {
 
           const ended = results.some(r => r.fnName === 'end_conversation');
 
+          // Store function results so we can inject them into the results-phase prompt
+          this._lastFunctionResults = results
+            .filter(r => r.fnName !== 'end_conversation')
+            .map(r => `${r.fnName}: ${r.result}`)
+            .join('\n');
+
           for (const { call_id, result } of results) {
             this._send({
               type: 'conversation.item.create',
@@ -314,12 +322,24 @@ class RealtimeClient extends EventEmitter {
         } else if (this._responsePhase === 'execute') {
           // No more functions to call — Phase 3: let model share results with audio
           this._responsePhase = 'results';
+          const fnResults = this._lastFunctionResults || '';
+          this._lastFunctionResults = '';
+
+          // Inject the function results as a system message so they're in the
+          // conversation history — the model can't miss them this way.
+          this._send({
+            type: 'conversation.item.create',
+            item: {
+              type: 'message',
+              role: 'user',
+              content: [{ type: 'input_text', text: `[SYSTEM] The functions have finished. Here are the results — you MUST speak ALL of this data to the user:\n\n${fnResults}\n\nSpeak these results now. Read EVERY item, EVERY number, and EVERY name listed above. Do NOT skip entries, abbreviate lists, or leave out any keg numbers, values, or data points. If there are 5 items, say all 5. Do NOT replace them with a generic response.` }],
+            },
+          });
           this._send({
             type: 'response.create',
             response: {
               modalities: ['text', 'audio'],
               tool_choice: 'none',
-              instructions: 'Now speak the function results to the user. You MUST relay every specific number, keg number, name, and data point from the function results — do not skip, abbreviate, or gloss over any of them.',
             },
           });
         } else if (this._responsePhase === 'results') {
